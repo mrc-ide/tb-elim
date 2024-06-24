@@ -1,2 +1,3 @@
-# tb-elim
-Models for the Tuberculosis elimination framework
+
+
+A linear algebra based compartmental model representing the dynamics of the tuberculosis epidemic in England
