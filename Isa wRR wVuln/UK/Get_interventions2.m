@@ -1,0 +1,182 @@
+clear all; load calibration_res.mat; 
+
+obj = @(x) get_objective2(x, ref, prm, gps, prm.contmat, lhd);
+
+midpt = true; 
+if midpt
+    % inds = find(outsto==max(outsto));
+    % xs = xsto(inds(1),:);
+    xs = x0_init;
+else
+    ix0 = size(xsto,1)/2;
+    nx  = 200;
+    dx  = round(ix0/nx);
+    xs  = xsto(ix0:dx:end,:);
+end
+
+mk = round(size(xs,1)/25);
+for ii = 1:size(xs,1)
+    
+    if mod(ii,mk)==0; fprintf('%0.5g ', ii/mk); end
+    
+    xx = xs(ii,:);
+    [out,aux] = obj(xx);
+    
+    init = aux.soln(end,:);
+
+    [p0,r0] = allocate_parameters(xx,p,r,xi);
+    r0.gamma = r0.gamma_2020;
+    M0 = make_model(p0,r0,i,s,gps,prm.contmat);
+    
+    % ---------------------------------------------------------------------
+    % --- Model intervention
+    
+    TPTcov = -log(1e-8);
+    TPTcov = 100;
+
+    % Better treatment overall
+    ra = r0; pa = p0;
+    ra.relapse(1) = 0;
+    pa.TPTeff = 1;
+    Ma = make_model(pa,ra,i,s,gps,prm.contmat);
+
+    % ACF
+    rb = ra; pb = pa;
+    rb.ACF = -log(1-0.75)*[1 1 1 1];
+    rb.ACF2 = -log(1-0.75)*[1 1 1 1];
+    Mb = make_model(pb,rb,i,s,gps,prm.contmat);
+
+    % TPT in recent migrants
+    p1 = pb; r1 = rb;
+    r1.TPT = TPTcov*[0 1 0 0];
+    M1 = make_model(p1,r1,i,s,gps,prm.contmat);
+    
+    % TPT in remote migrants
+    p2 = p1; r2 = r1;
+    r2.TPT = TPTcov*[0 1 1 0];
+    M2 = make_model(p2,r2,i,s,gps,prm.contmat);
+    
+    % TPT at entry
+    p3 = p2; r3 = r2;
+    r3.migrTPT = 1;
+    M3 = make_model(p3,r3,i,s,gps,prm.contmat);
+
+    % TPT in vulnerable
+    p4 = p3; r4 = r3;
+    r4.TPT = TPTcov*[0 1 1 1];
+    M4 = make_model(p4,r4,i,s,gps,prm.contmat);
+
+    % TPT in domestic
+    p5 = p4; r5 = r4;
+    r5.TPT = 200*[1 1 1 1];
+    r5.relapse(end) = 0;
+    M5 = make_model(p5,r5,i,s,gps,prm.contmat);
+    
+
+    models = {M0, Ma, Mb, M1, M2, M3, M4, M5};    
+    
+    for mi = 1:length(models)
+        
+        if mi<400
+            geq = @(t,in) goveqs_scaleup(t, in, i, s, M0, models{mi}, p0, p1, [2022 2025], agg, sel, r0);
+        else
+            geq = @(t,in) goveqs_scaleup(t, in, i, s, M0, models{mi}, p0, p3, [2022 2025], agg, sel, r0);
+        end
+        [t,soln] = ode15s(geq, [2022:2036], init);
+        
+        endsolsto(mi,:) = soln(end,:);
+        
+        sdiff = diff(soln,[],1);
+        incsto(:,ii,mi) = sdiff(:,i.aux.inc(1))*1e5;
+        mrtsto(:,ii,mi) = sdiff(:,i.aux.mort)*1e5;
+        
+        % Get proportions from different sources
+        vec = sdiff(end,i.aux.incsources)*1e5;
+        props(ii,:,mi) = vec/sum(vec);
+    end
+end
+fprintf('\n');
+
+
+incmat = permute(prctile(incsto,[2.5,50,97.5],2),[2,1,3]);
+mrtmat = permute(prctile(mrtsto,[2.5,50,97.5],2),[2,1,3]);
+
+
+% -------------------------------------------------------------------------
+% --- Plot figure of incidence and mortality impacts ----------------------
+
+ff=figure; lw = 1.5; fs = 14;
+allmat = cat(4,incmat,mrtmat);
+
+cols = linspecer(size(allmat,3));
+xx = [2022:2035];
+
+tis = {'Incidence','Mortality'};
+for is = 1:2
+    subplot(1,2,is); hold on;
+    
+    for ii = 1:size(allmat,3)
+        plt = allmat(:,:,ii,is);
+        lg(ii,:) = plot(xx, plt(2,:), 'Color', cols(ii,:), 'linewidth', lw); hold on;
+        jbfill(xx, plt(3,:), plt(1,:), cols(ii,:), 'None', 1, 0.1); hold on;
+    end
+    yl = ylim; yl(1) = 0; ylim(yl);
+    xlim([2022 2035]);
+    set(gca,'fontsize',fs);
+    
+    title(tis{is});
+end
+subplot(1,2,1);
+yline(1,'k--');
+yline(0.1,'k--');
+% legend(lg, 'Baseline','TPT, recent migrants','+ Case-finding, active TB','+ TPT, new migrants (hypothetical)','+ TPT, domestic (hypothetical)', 'Elimination target','location','SouthWest');
+legend(lg,'0','a','b','1','2','3','4');
+ylabel('Rate per 100,000 population');
+
+
+% --- Find remaining sources of incidence
+vec = squeeze(props(end,:,end));
+
+
+                                              % 1.DS/RR, 2.Dom/Migr/Vuln, 3.L/P/R/T
+
+
+tmp  = abs(vec)/sum(abs(vec));
+tmp2 = sortrows([tmp; 1:length(tmp)]',-1);
+
+lbls = {}; ind = 1;
+set1 = {'ds','rr'};
+set2 = {'dom','migr','vuln'};
+set3 = {'L','P','R','T'};
+for is3 = 1:length(set3)
+    for is2 = 1:length(set2)
+        for is1 = 1:length(set1)
+            lbls{ind} = [set1{is1}, ' ', set2{is2}, ' ', set3{is3}];
+            ind = ind+1;
+        end
+    end
+end
+
+inds = tmp2(1:6,2)'
+tmp2(1:6,1)'
+lbls(inds)
+
+
+
+
+
+return;
+
+% -------------------------------------------------------------------------
+% --- Plot figure of incidence components as of 2030 ----------------------
+
+tmp1 = reshape(props(:,:,end),3,5);                                        % Dims: 1.Dom/migr_rect/migr_long, 2.Lf,Pf,Ls,Ps,R
+tmp2 = [tmp1(1,:); sum([tmp1(2,:); tmp1(3,:)],1)];                         % Dims: 1.Dom/all migr, 2.Lf,Pf,Ls,Ps,R
+tmp3 = [sum(tmp2(:,[1,3]),2), sum(tmp2(:,[2,4]),2), tmp2(:,end)];          % Dims: 1.Dom/all migr, 2.All L, All P, R
+tmp4 = [tmp3(1,:), tmp3(2,:)];
+labels = {'UK-born without treatment history', 'UK-born after TPT', 'UK-born after TB Rx', 'Migrants without treatment history', 'Migrants after TPT', 'Migrants after TB Rx'};
+figure; pie(tmp4);
+legend(labels,'Location','NorthWest','Orientation','vertical');
+title('Sources of incidence in 2035 with all interventions combined')
+
+
